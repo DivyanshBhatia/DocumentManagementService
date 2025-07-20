@@ -1,4 +1,4 @@
-# main.py - Fixed for Python 3.13 compatibility with psycopg v3 and Neon deployment
+# main.py - Fixed database table creation for Python 3.13 compatibility
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
@@ -48,6 +48,38 @@ ASYNC_DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg:/
 
 print(f"Connecting to database: {ASYNC_DATABASE_URL.split('@')[0]}@***")
 
+# Initialize global variables
+async_engine = None
+sync_engine = None
+SessionLocal = None
+AsyncSessionLocal = None
+Base = declarative_base()
+DATABASE_AVAILABLE = False
+SYNC_DB_AVAILABLE = False
+
+# Database Models (Define before engine creation)
+class Document(Base):
+    __tablename__ = "documents"
+
+    sno = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    document_type = Column(String(100), nullable=False)
+    document_owner = Column(String(100), nullable=False)
+    document_number = Column(String(50), unique=True, nullable=False)
+    expiry_date = Column(Date, nullable=False)
+    action_due_date = Column(Date, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    username = Column(String(50), unique=True, nullable=False)
+    email = Column(String(100), unique=True, nullable=False)
+    role = Column(String(20), nullable=False, default="user")  # admin, owner, user
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+# Database connection setup
 try:
     # Create async engine with psycopg v3 for Python 3.13 compatibility
     async_engine = create_async_engine(
@@ -96,7 +128,6 @@ try:
         expire_on_commit=False
     )
 
-    Base = declarative_base()
     DATABASE_AVAILABLE = True
     print("✅ Async database connection successful with psycopg v3!")
 
@@ -114,7 +145,6 @@ except Exception as e:
     sync_engine = None
     SessionLocal = None
     AsyncSessionLocal = None
-    Base = declarative_base()
     DATABASE_AVAILABLE = False
     SYNC_DB_AVAILABLE = False
 
@@ -130,37 +160,55 @@ SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@company.com")
 
-# Database Models
-class Document(Base):
-    __tablename__ = "documents"
-
-    sno = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    document_type = Column(String(100), nullable=False)
-    document_owner = Column(String(100), nullable=False)
-    document_number = Column(String(50), unique=True, nullable=False)
-    expiry_date = Column(Date, nullable=False)
-    action_due_date = Column(Date, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-class User(Base):
-    __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    username = Column(String(50), unique=True, nullable=False)
-    email = Column(String(100), unique=True, nullable=False)
-    role = Column(String(20), nullable=False, default="user")  # admin, owner, user
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-# Create tables only if engine is available
+# Enhanced table creation function
 async def create_tables():
+    """Create tables in both async and sync engines"""
+    tables_created = False
+
+    # Try async table creation first
     if async_engine and DATABASE_AVAILABLE:
         try:
             async with async_engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
-            print("✅ Database tables created/verified successfully!")
+            print("✅ Database tables created/verified successfully (async)!")
+            tables_created = True
         except Exception as e:
-            print(f"⚠️ Could not create tables: {str(e)}")
+            print(f"⚠️ Could not create async tables: {str(e)}")
+
+    # Try sync table creation if async failed or if we have sync engine
+    if sync_engine and SYNC_DB_AVAILABLE and not tables_created:
+        try:
+            Base.metadata.create_all(bind=sync_engine)
+            print("✅ Database tables created/verified successfully (sync)!")
+            tables_created = True
+        except Exception as e:
+            print(f"⚠️ Could not create sync tables: {str(e)}")
+
+    if not tables_created:
+        print("❌ Failed to create tables in both async and sync engines")
+
+    return tables_created
+
+# Function to ensure tables exist before operations
+def ensure_tables_exist():
+    """Ensure tables exist in sync engine before operations"""
+    if sync_engine and SYNC_DB_AVAILABLE:
+        try:
+            # Check if tables exist
+            from sqlalchemy import inspect
+            inspector = inspect(sync_engine)
+            existing_tables = inspector.get_table_names()
+
+            if 'documents' not in existing_tables or 'users' not in existing_tables:
+                print("📋 Creating missing tables...")
+                Base.metadata.create_all(bind=sync_engine)
+                print("✅ Tables created successfully!")
+
+            return True
+        except Exception as e:
+            print(f"❌ Error ensuring tables exist: {str(e)}")
+            return False
+    return False
 
 # Pydantic Models
 class DocumentCreate(BaseModel):
@@ -213,13 +261,21 @@ app.add_middleware(
 # Security
 security = HTTPBearer()
 
-# Dependency to get database session
+# Enhanced dependency to get database session with table verification
 def get_db():
     if not SessionLocal or not SYNC_DB_AVAILABLE:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Database connection not available. Please check database configuration."
         )
+
+    # Ensure tables exist before proceeding
+    if not ensure_tables_exist():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database tables not available. Please check database setup."
+        )
+
     db = SessionLocal()
     try:
         yield db
@@ -410,8 +466,12 @@ scheduler = AsyncIOScheduler()
 
 @app.on_event("startup")
 async def startup_event():
-    # Create tables
-    await create_tables()
+    # Create tables with enhanced error handling
+    print("🚀 Starting Document Management API...")
+    tables_created = await create_tables()
+
+    if not tables_created:
+        print("⚠️ Warning: Tables may not be properly created. API will attempt to create them on-demand.")
 
     # Only start scheduler if database is available
     if AsyncSessionLocal and DATABASE_AVAILABLE:
@@ -465,6 +525,7 @@ async def health_check():
     """Health check endpoint with database connectivity test"""
     db_status = "disconnected"
     db_details = {}
+    table_status = {}
 
     if AsyncSessionLocal and DATABASE_AVAILABLE:
         try:
@@ -477,6 +538,20 @@ async def health_check():
                     "database": row[1] if row[1] else "Unknown",
                     "user": row[2] if row[2] else "Unknown"
                 }
+
+                # Check if tables exist
+                try:
+                    doc_count = await db.execute(text("SELECT COUNT(*) FROM documents"))
+                    user_count = await db.execute(text("SELECT COUNT(*) FROM users"))
+                    table_status = {
+                        "documents_table": "exists",
+                        "users_table": "exists",
+                        "document_count": doc_count.scalar(),
+                        "user_count": user_count.scalar()
+                    }
+                except Exception as table_e:
+                    table_status = {"error": f"Tables may not exist: {str(table_e)}"}
+
         except Exception as e:
             db_status = f"error: {str(e)}"
 
@@ -485,6 +560,7 @@ async def health_check():
         "timestamp": datetime.utcnow(),
         "database": db_status,
         "database_details": db_details,
+        "table_status": table_status,
         "scheduler": "running" if scheduler.running else "stopped",
         "email_support": EMAIL_AVAILABLE,
         "python_version": "3.13",
@@ -510,6 +586,29 @@ async def create_access_token(username: str, role: str = "user"):
         "username": username,
         "role": role
     }
+
+# New endpoint to manually create tables
+@app.post("/admin/create-tables")
+async def create_tables_endpoint():
+    """Manually create database tables (development/debugging endpoint)"""
+    try:
+        tables_created = await create_tables()
+
+        # Also ensure sync tables exist
+        sync_tables_created = ensure_tables_exist()
+
+        return {
+            "message": "Table creation attempted",
+            "async_tables_created": tables_created,
+            "sync_tables_created": sync_tables_created,
+            "database_available": DATABASE_AVAILABLE,
+            "sync_db_available": SYNC_DB_AVAILABLE
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create tables: {str(e)}"
+        )
 
 # Document endpoints with proper error handling
 @app.post("/documents/", response_model=DocumentResponse)

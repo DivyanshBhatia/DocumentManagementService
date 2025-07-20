@@ -1,10 +1,10 @@
 # FastAPI and dependencies - Python 3.13 compatible
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
+fastapi==0.108.0
+uvicorn[standard]==0.25.0
 python-multipart==0.0.6
 
-# Database - Use psycopg (v3) which has better Python 3.13 support
-sqlalchemy[asyncio]==2.0.23
+# Database - Use newer SQLAlchemy version that supports Python 3.13
+sqlalchemy[asyncio]>=2.0.25
 
 # Use psycopg (version 3) - Updated to available versions
 # psycopg v3 has native asyncio support and works with Python 3.13
@@ -19,7 +19,7 @@ pyjwt==2.8.0
 passlib[bcrypt]==1.7.4
 itsdangerous==2.1.2
 
-# Scheduling
+# Scheduling - Updated for Python 3.13
 apscheduler==3.10.4
 
 # Environment management
