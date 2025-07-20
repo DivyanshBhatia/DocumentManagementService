@@ -1,0 +1,48 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: document_management_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: document_management
+      MYSQL_USER: docuser
+      MYSQL_PASSWORD: docpassword
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - document_network
+
+  api:
+    build: .
+    container_name: document_management_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=mysql+pymysql://docuser:docpassword@mysql/document_management
+      - JWT_SECRET=your-super-secret-jwt-key-here-make-it-long-and-random
+      - SMTP_SERVER=smtp.gmail.com
+      - SMTP_PORT=587
+      - SMTP_USERNAME=your-email@gmail.com
+      - SMTP_PASSWORD=your-app-password
+      - ADMIN_EMAIL=admin@company.com
+    depends_on:
+      - mysql
+    networks:
+      - document_network
+    volumes:
+      - ./.env:/app/.env
+
+volumes:
+  mysql_data:
+
+networks:
+  document_network:
+    driver: bridge
