@@ -3,12 +3,15 @@ fastapi==0.104.1
 uvicorn[standard]==0.24.0
 python-multipart==0.0.6
 
-# Database - asyncpg for Python 3.13 compatibility instead of psycopg2
+# Database - Use psycopg (v3) which has better Python 3.13 support
 sqlalchemy[asyncio]==2.0.23
-asyncpg==0.29.0
 
-# Fallback: Latest psycopg2-binary (may work with Python 3.13)
-# Comment out if asyncpg works fine
+# Use psycopg (version 3) instead of asyncpg for better Python 3.13 compatibility
+# psycopg v3 has native asyncio support and works with Python 3.13
+psycopg[binary]==3.1.15
+psycopg[pool]==3.1.15
+
+# Fallback: Keep psycopg2-binary for sync operations
 psycopg2-binary>=2.9.9
 
 # Authentication & Security
@@ -31,10 +34,8 @@ jinja2==3.1.2
 # Email functionality (optional but recommended)
 yagmail==0.15.293
 
-# Development and testing (optional)
-# pytest==7.4.3
-# pytest-asyncio==0.21.1
-# httpx==0.25.2
-
 # Additional packages for better Python 3.13 support
 typing-extensions>=4.8.0
+
+# Alternative: Use asyncio-compatible packages
+aiopg==1.4.0  # Alternative async PostgreSQL driver

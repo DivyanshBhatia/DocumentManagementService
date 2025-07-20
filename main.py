@@ -1,4 +1,4 @@
-# main.py - Fixed for Python 3.13 compatibility with asyncpg and Neon deployment
+# main.py - Fixed for Python 3.13 compatibility with psycopg v3 and Neon deployment
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,7 +28,7 @@ except ImportError:
 
 load_dotenv()
 
-# Database Configuration - Fixed for Neon with Python 3.13 using asyncpg
+# Database Configuration - Fixed for Neon with Python 3.13 using psycopg v3
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 # If no DATABASE_URL in env, construct from your connection string
@@ -43,13 +43,13 @@ if DATABASE_URL.startswith('psql '):
     if url_match:
         DATABASE_URL = url_match.group(1)
 
-# Convert to asyncpg format if using postgresql://
-ASYNC_DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+# For psycopg v3 async support
+ASYNC_DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
 print(f"Connecting to database: {ASYNC_DATABASE_URL.split('@')[0]}@***")
 
 try:
-    # Create async engine with asyncpg for Python 3.13 compatibility
+    # Create async engine with psycopg v3 for Python 3.13 compatibility
     async_engine = create_async_engine(
         ASYNC_DATABASE_URL,
         pool_size=5,
@@ -64,8 +64,7 @@ try:
         echo=False  # Disable SQL logging for production
     )
 
-    # For synchronous operations, we'll also create a sync engine with psycopg2
-    # Try with the latest psycopg2-binary that might work
+    # For synchronous operations with psycopg2-binary
     try:
         from sqlalchemy import create_engine
         sync_engine = create_engine(
@@ -99,15 +98,15 @@ try:
 
     Base = declarative_base()
     DATABASE_AVAILABLE = True
-    print("✅ Async database connection successful!")
+    print("✅ Async database connection successful with psycopg v3!")
 
 except Exception as e:
     print(f"❌ Database connection error: {str(e)}")
     print("📋 Troubleshooting steps:")
-    print("1. Install asyncpg for Python 3.13 support:")
-    print("   pip install asyncpg")
-    print("2. Or downgrade Python to 3.11/3.12:")
-    print("   pyenv install 3.12.7")
+    print("1. Install psycopg v3 for Python 3.13 support:")
+    print("   pip install 'psycopg[binary]' 'psycopg[pool]'")
+    print("2. Or use alternative driver aiopg:")
+    print("   pip install aiopg")
     print("3. Check your requirements.txt")
 
     # Create dummy engines for build process
@@ -454,7 +453,7 @@ async def root():
         "status": "active",
         "docs": "/docs",
         "health": "/health",
-        "database": "Neon PostgreSQL with asyncpg",
+        "database": "Neon PostgreSQL with psycopg v3",
         "database_available": DATABASE_AVAILABLE,
         "sync_db_available": SYNC_DB_AVAILABLE,
         "email_support": EMAIL_AVAILABLE,
