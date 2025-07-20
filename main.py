@@ -1,4 +1,4 @@
-# main.py
+# main.py - Updated for Render deployment with PostgreSQL
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,11 +21,23 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Database Configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "mysql+pymysql://username:password@localhost/document_management")
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+# Database Configuration - Updated for PostgreSQL on Render
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://username:password@localhost/document_management")
+
+# Fix for Render's DATABASE_URL format
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+try:
+    engine = create_engine(DATABASE_URL)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base = declarative_base()
+except Exception as e:
+    print(f"Database connection error: {str(e)}")
+    # Create a dummy engine for build process
+    engine = None
+    SessionLocal = None
+    Base = declarative_base()
 
 # JWT Configuration
 JWT_SECRET = os.getenv("JWT_SECRET", "your-secret-key")
@@ -61,8 +73,12 @@ class User(Base):
     role = Column(String(20), nullable=False, default="user")  # admin, owner, user
     created_at = Column(DateTime, default=datetime.utcnow)
 
-# Create tables
-Base.metadata.create_all(bind=engine)
+# Create tables only if engine is available
+if engine:
+    try:
+        Base.metadata.create_all(bind=engine)
+    except Exception as e:
+        print(f"Could not create tables: {str(e)}")
 
 # Pydantic Models
 class DocumentCreate(BaseModel):
@@ -97,7 +113,11 @@ class TokenData(BaseModel):
     role: str
 
 # FastAPI App
-app = FastAPI(title="Document Management API", version="1.0.0")
+app = FastAPI(
+    title="Document Management API",
+    version="1.0.0",
+    description="A comprehensive document management system with automated reminders"
+)
 
 # CORS Middleware
 app.add_middleware(
@@ -113,6 +133,11 @@ security = HTTPBearer()
 
 # Dependency to get database session
 def get_db():
+    if not SessionLocal:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection not available"
+        )
     db = SessionLocal()
     try:
         yield db
@@ -156,6 +181,10 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
 
 # Helper function to send email notifications
 async def send_email_notification(subject: str, body: str, recipients: List[str]):
+    if not SMTP_USERNAME or not SMTP_PASSWORD:
+        print("Email credentials not configured, skipping email notification")
+        return False
+
     try:
         msg = MimeMultipart()
         msg['From'] = SMTP_USERNAME
@@ -181,6 +210,10 @@ async def send_email_notification(subject: str, body: str, recipients: List[str]
 async def check_expiry_reminders():
     print(f"Running expiry reminder check at {datetime.now()}")
 
+    if not SessionLocal:
+        print("Database connection not available for reminder check")
+        return
+
     db = SessionLocal()
     try:
         # Get documents expiring within 30 days
@@ -205,48 +238,56 @@ async def check_expiry_reminders():
             return
 
         # Prepare email content
-        email_body = """
+        email_body = f"""
         <html>
         <body>
-            <h2>Document Expiry Reminder</h2>
-            <p>The following documents are expiring within 30 days:</p>
-            <table border="1" style="border-collapse: collapse;">
-                <tr>
-                    <th>Document Type</th>
-                    <th>Owner</th>
-                    <th>Document Number</th>
-                    <th>Expiry Date</th>
-                    <th>Action Due Date</th>
+            <h2>📋 Document Expiry Reminder</h2>
+            <p>The following {len(expiring_docs)} document(s) are expiring within 30 days:</p>
+            <table border="1" style="border-collapse: collapse; width: 100%;">
+                <tr style="background-color: #f2f2f2;">
+                    <th style="padding: 8px;">Document Type</th>
+                    <th style="padding: 8px;">Owner</th>
+                    <th style="padding: 8px;">Document Number</th>
+                    <th style="padding: 8px;">Expiry Date</th>
+                    <th style="padding: 8px;">Action Due Date</th>
                 </tr>
         """
 
         for doc in expiring_docs:
+            days_until_expiry = (doc.expiry_date - date.today()).days
+            color = "#ffebee" if days_until_expiry <= 7 else "#fff3e0" if days_until_expiry <= 14 else "#f3e5f5"
+
             email_body += f"""
-                <tr>
-                    <td>{doc.document_type}</td>
-                    <td>{doc.document_owner}</td>
-                    <td>{doc.document_number}</td>
-                    <td>{doc.expiry_date}</td>
-                    <td>{doc.action_due_date}</td>
+                <tr style="background-color: {color};">
+                    <td style="padding: 8px;">{doc.document_type}</td>
+                    <td style="padding: 8px;">{doc.document_owner}</td>
+                    <td style="padding: 8px;">{doc.document_number}</td>
+                    <td style="padding: 8px;">{doc.expiry_date} ({days_until_expiry} days)</td>
+                    <td style="padding: 8px;">{doc.action_due_date}</td>
                 </tr>
             """
 
         email_body += """
             </table>
-            <p>Please take necessary action before the expiry dates.</p>
+            <br>
+            <p><strong>⚠️ Please take necessary action before the expiry dates.</strong></p>
+            <p><small>This is an automated reminder from your Document Management System.</small></p>
         </body>
         </html>
         """
 
         recipients = [user.email for user in admin_users]
 
-        await send_email_notification(
-            subject="Document Expiry Reminder",
+        success = await send_email_notification(
+            subject=f"🔔 Document Expiry Reminder - {len(expiring_docs)} documents expiring soon",
             body=email_body,
             recipients=recipients
         )
 
-        print(f"Reminder sent for {len(expiring_docs)} documents to {len(recipients)} recipients")
+        if success:
+            print(f"Reminder sent for {len(expiring_docs)} documents to {len(recipients)} recipients")
+        else:
+            print("Failed to send reminder email")
 
     except Exception as e:
         print(f"Error in reminder check: {str(e)}")
@@ -258,32 +299,72 @@ scheduler = AsyncIOScheduler()
 
 @app.on_event("startup")
 async def startup_event():
-    # Schedule daily reminder check at 9 AM
-    scheduler.add_job(
-        check_expiry_reminders,
-        CronTrigger(hour=9, minute=0),
-        id="daily_reminder_check"
-    )
-    scheduler.start()
-    print("Scheduler started - Daily reminder check at 9:00 AM")
+    # Only start scheduler if database is available
+    if SessionLocal:
+        try:
+            # Schedule daily reminder check at 9 AM UTC
+            scheduler.add_job(
+                check_expiry_reminders,
+                CronTrigger(hour=9, minute=0),
+                id="daily_reminder_check"
+            )
+            scheduler.start()
+            print("✅ Scheduler started - Daily reminder check at 9:00 AM UTC")
+        except Exception as e:
+            print(f"Failed to start scheduler: {str(e)}")
+    else:
+        print("⚠️ Scheduler not started - Database connection unavailable")
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    scheduler.shutdown()
+    try:
+        scheduler.shutdown()
+        print("Scheduler shut down successfully")
+    except Exception as e:
+        print(f"Error shutting down scheduler: {str(e)}")
 
 # API Endpoints
 
+@app.get("/")
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "message": "Document Management API",
+        "version": "1.0.0",
+        "status": "active",
+        "docs": "/docs",
+        "health": "/health"
+    }
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    db_status = "connected" if SessionLocal else "disconnected"
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow(),
+        "database": db_status,
+        "scheduler": "running" if scheduler.running else "stopped"
+    }
+
 @app.post("/auth/token")
 async def create_access_token(username: str, role: str = "user"):
-    """Create JWT token for authentication (for testing purposes)"""
+    """Create JWT token for authentication"""
     payload = {
         "sub": username,
         "role": role,
         "static_string": STATIC_TOKEN_STRING,
-        "exp": datetime.utcnow() + timedelta(hours=24)
+        "exp": datetime.utcnow() + timedelta(hours=24),
+        "iat": datetime.utcnow()
     }
     token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    return {"access_token": token, "token_type": "bearer"}
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": 86400,  # 24 hours
+        "username": username,
+        "role": role
+    }
 
 @app.post("/documents/", response_model=DocumentResponse)
 async def create_document(
@@ -304,12 +385,27 @@ async def create_document(
                 detail="Document number already exists"
             )
 
+        # Validate dates
+        if document.expiry_date < date.today():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Expiry date cannot be in the past"
+            )
+
+        if document.action_due_date > document.expiry_date:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Action due date cannot be after expiry date"
+            )
+
         db_document = Document(**document.dict())
         db.add(db_document)
         db.commit()
         db.refresh(db_document)
 
         return db_document
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(
@@ -321,11 +417,21 @@ async def create_document(
 async def get_documents(
     skip: int = 0,
     limit: int = 100,
+    document_type: Optional[str] = None,
+    owner: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(verify_token)
 ):
-    """Retrieve all documents with pagination"""
-    documents = db.query(Document).offset(skip).limit(limit).all()
+    """Retrieve all documents with pagination and filtering"""
+    query = db.query(Document)
+
+    if document_type:
+        query = query.filter(Document.document_type.ilike(f"%{document_type}%"))
+
+    if owner:
+        query = query.filter(Document.document_owner.ilike(f"%{owner}%"))
+
+    documents = query.offset(skip).limit(limit).all()
     return documents
 
 @app.get("/documents/{sno}", response_model=DocumentResponse)
@@ -339,7 +445,7 @@ async def get_document(
     if not document:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Document not found"
+            detail=f"Document with SNo {sno} not found"
         )
     return document
 
@@ -355,12 +461,19 @@ async def update_document(
     if not document:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Document not found"
+            detail=f"Document with SNo {sno} not found"
         )
 
     try:
         # Update only provided fields
         update_data = document_update.dict(exclude_unset=True)
+
+        # Validate dates if provided
+        if "expiry_date" in update_data and update_data["expiry_date"] < date.today():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Expiry date cannot be in the past"
+            )
 
         # Check if document number is being updated and if it already exists
         if "document_number" in update_data:
@@ -383,6 +496,8 @@ async def update_document(
         db.refresh(document)
 
         return document
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(
@@ -401,13 +516,22 @@ async def delete_document(
     if not document:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Document not found"
+            detail=f"Document with SNo {sno} not found"
         )
 
     try:
+        document_info = {
+            "sno": document.sno,
+            "document_type": document.document_type,
+            "document_number": document.document_number
+        }
+
         db.delete(document)
         db.commit()
-        return {"message": "Document deleted successfully"}
+        return {
+            "message": "Document deleted successfully",
+            "deleted_document": document_info
+        }
     except Exception as e:
         db.rollback()
         raise HTTPException(
