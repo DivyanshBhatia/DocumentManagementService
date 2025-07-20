@@ -1,4 +1,4 @@
-# main.py - Updated for Render deployment with PostgreSQL
+# main.py - Updated for Neon deployment
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,19 +21,39 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Database Configuration - Updated for PostgreSQL on Render
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://username:password@localhost/document_management")
+# Database Configuration - Updated for Neon
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "psql 'postgresql://neondb_owner:npg_LuK5zQJy3Ftg@ep-lingering-leaf-a1qcmj51-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require'"
+)
 
-# Fix for Render's DATABASE_URL format
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# Neon uses postgresql:// format, no need to convert
+print(f"Connecting to database: {DATABASE_URL.split('@')[0]}@***")
 
 try:
-    engine = create_engine(DATABASE_URL)
+    # Create engine with Neon-specific settings
+    engine = create_engine(
+        DATABASE_URL,
+        pool_size=10,
+        max_overflow=20,
+        pool_pre_ping=True,
+        pool_recycle=300,
+        connect_args={
+            "sslmode": "require",
+            "application_name": "document-management-api"
+        }
+    )
+
+    # Test connection
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+        print("✅ Database connection successful!")
+
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     Base = declarative_base()
+
 except Exception as e:
-    print(f"Database connection error: {str(e)}")
+    print(f"❌ Database connection error: {str(e)}")
     # Create a dummy engine for build process
     engine = None
     SessionLocal = None
@@ -77,8 +97,9 @@ class User(Base):
 if engine:
     try:
         Base.metadata.create_all(bind=engine)
+        print("✅ Database tables created/verified successfully!")
     except Exception as e:
-        print(f"Could not create tables: {str(e)}")
+        print(f"⚠️ Could not create tables: {str(e)}")
 
 # Pydantic Models
 class DocumentCreate(BaseModel):
@@ -116,7 +137,7 @@ class TokenData(BaseModel):
 app = FastAPI(
     title="Document Management API",
     version="1.0.0",
-    description="A comprehensive document management system with automated reminders"
+    description="A comprehensive document management system with automated reminders - Powered by Neon"
 )
 
 # CORS Middleware
@@ -329,21 +350,41 @@ async def shutdown_event():
 async def root():
     """Root endpoint with API information"""
     return {
-        "message": "Document Management API",
+        "message": "Document Management API - Powered by Neon Database",
         "version": "1.0.0",
         "status": "active",
         "docs": "/docs",
-        "health": "/health"
+        "health": "/health",
+        "database": "Neon PostgreSQL"
     }
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
-    db_status = "connected" if SessionLocal else "disconnected"
+    """Health check endpoint with database connectivity test"""
+    db_status = "disconnected"
+    db_details = {}
+
+    if SessionLocal:
+        try:
+            db = SessionLocal()
+            with db.connection() as conn:
+                result = conn.execute(text("SELECT version(), current_database(), current_user"))
+                row = result.fetchone()
+                db_status = "connected"
+                db_details = {
+                    "version": row[0].split()[0:2] if row[0] else "Unknown",
+                    "database": row[1] if row[1] else "Unknown",
+                    "user": row[2] if row[2] else "Unknown"
+                }
+            db.close()
+        except Exception as e:
+            db_status = f"error: {str(e)}"
+
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow(),
         "database": db_status,
+        "database_details": db_details,
         "scheduler": "running" if scheduler.running else "stopped"
     }
 
@@ -572,11 +613,6 @@ async def get_expiring_documents(
         "count": len(expiring_docs),
         "days_ahead": days
     }
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy", "timestamp": datetime.utcnow()}
 
 if __name__ == "__main__":
     import uvicorn
