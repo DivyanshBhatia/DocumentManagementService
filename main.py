@@ -1,4 +1,4 @@
-# main.py - Updated for Neon deployment
+# main.py - Updated for Python 3.13 compatibility and Neon deployment
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,21 +13,36 @@ import hashlib
 import asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-import smtplib
-from email.mime.text import MimeText
-from email.mime.multipart import MimeMultipart
 import os
 from dotenv import load_dotenv
 
+# Email imports with Python 3.13 compatibility
+try:
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    EMAIL_AVAILABLE = True
+except ImportError:
+    # Fallback for email functionality
+    EMAIL_AVAILABLE = False
+    print("⚠️ Email functionality not available - email imports failed")
+
 load_dotenv()
 
-# Database Configuration - Updated for Neon
+# Database Configuration - Fixed for Neon
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "psql 'postgresql://neondb_owner:npg_LuK5zQJy3Ftg@ep-lingering-leaf-a1qcmj51-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require'"
+    "postgresql://neondb_owner:npg_LuK5zQJy3Ftg@ep-lingering-leaf-a1qcmj51-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
 )
 
-# Neon uses postgresql:// format, no need to convert
+# Clean up the DATABASE_URL if it contains psql command wrapper
+if DATABASE_URL.startswith('psql '):
+    # Extract the actual URL from the psql command
+    import re
+    url_match = re.search(r"'([^']+)'", DATABASE_URL)
+    if url_match:
+        DATABASE_URL = url_match.group(1)
+
 print(f"Connecting to database: {DATABASE_URL.split('@')[0]}@***")
 
 try:
@@ -202,15 +217,19 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
 
 # Helper function to send email notifications
 async def send_email_notification(subject: str, body: str, recipients: List[str]):
+    if not EMAIL_AVAILABLE:
+        print("Email functionality not available - skipping email notification")
+        return False
+
     if not SMTP_USERNAME or not SMTP_PASSWORD:
         print("Email credentials not configured, skipping email notification")
         return False
 
     try:
-        msg = MimeMultipart()
+        msg = MIMEMultipart()
         msg['From'] = SMTP_USERNAME
         msg['Subject'] = subject
-        msg.attach(MimeText(body, 'html'))
+        msg.attach(MIMEText(body, 'html'))
 
         server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
         server.starttls()
@@ -355,7 +374,8 @@ async def root():
         "status": "active",
         "docs": "/docs",
         "health": "/health",
-        "database": "Neon PostgreSQL"
+        "database": "Neon PostgreSQL",
+        "email_support": EMAIL_AVAILABLE
     }
 
 @app.get("/health")
@@ -385,7 +405,8 @@ async def health_check():
         "timestamp": datetime.utcnow(),
         "database": db_status,
         "database_details": db_details,
-        "scheduler": "running" if scheduler.running else "stopped"
+        "scheduler": "running" if scheduler.running else "stopped",
+        "email_support": EMAIL_AVAILABLE
     }
 
 @app.post("/auth/token")
