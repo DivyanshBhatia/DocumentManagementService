@@ -1,10 +1,11 @@
-# main.py - Fixed for Python 3.13 compatibility and Neon deployment
+# main.py - Fixed for Python 3.13 compatibility with asyncpg and Neon deployment
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, Integer, String, Date, DateTime, text
+from sqlalchemy import Column, Integer, String, Date, DateTime, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from pydantic import BaseModel, Field
 from datetime import datetime, date, timedelta
 from typing import Optional, List
@@ -27,7 +28,7 @@ except ImportError:
 
 load_dotenv()
 
-# Database Configuration - Fixed for Neon with Python 3.13
+# Database Configuration - Fixed for Neon with Python 3.13 using asyncpg
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 # If no DATABASE_URL in env, construct from your connection string
@@ -42,51 +43,81 @@ if DATABASE_URL.startswith('psql '):
     if url_match:
         DATABASE_URL = url_match.group(1)
 
-print(f"Connecting to database: {DATABASE_URL.split('@')[0]}@***")
+# Convert to asyncpg format if using postgresql://
+ASYNC_DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+print(f"Connecting to database: {ASYNC_DATABASE_URL.split('@')[0]}@***")
 
 try:
-    # Create engine with Neon-specific settings optimized for Python 3.13
-    engine = create_engine(
-        DATABASE_URL,
-        pool_size=5,  # Reduced pool size
-        max_overflow=10,  # Reduced overflow
+    # Create async engine with asyncpg for Python 3.13 compatibility
+    async_engine = create_async_engine(
+        ASYNC_DATABASE_URL,
+        pool_size=5,
+        max_overflow=10,
         pool_pre_ping=True,
         pool_recycle=300,
         connect_args={
-            "sslmode": "require",
-            "application_name": "document-management-api",
-            # Remove channel_binding as it might cause issues
-            "connect_timeout": 10,
-            "command_timeout": 30
+            "server_settings": {
+                "application_name": "document-management-api",
+            }
         },
         echo=False  # Disable SQL logging for production
     )
 
-    # Test connection with proper error handling
-    with engine.connect() as conn:
-        result = conn.execute(text("SELECT 1"))
-        result.fetchone()
-        print("✅ Database connection successful!")
+    # For synchronous operations, we'll also create a sync engine with psycopg2
+    # Try with the latest psycopg2-binary that might work
+    try:
+        from sqlalchemy import create_engine
+        sync_engine = create_engine(
+            DATABASE_URL,
+            pool_size=3,
+            max_overflow=5,
+            pool_pre_ping=True,
+            pool_recycle=300,
+            connect_args={
+                "sslmode": "require",
+                "application_name": "document-management-api-sync",
+                "connect_timeout": 10,
+            },
+            echo=False
+        )
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=sync_engine)
+        SYNC_DB_AVAILABLE = True
+        print("✅ Synchronous database connection configured!")
+    except Exception as sync_e:
+        print(f"⚠️ Sync database unavailable: {sync_e}")
+        SessionLocal = None
+        sync_engine = None
+        SYNC_DB_AVAILABLE = False
 
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    # Async session maker
+    AsyncSessionLocal = async_sessionmaker(
+        async_engine,
+        class_=AsyncSession,
+        expire_on_commit=False
+    )
+
     Base = declarative_base()
     DATABASE_AVAILABLE = True
+    print("✅ Async database connection successful!")
 
 except Exception as e:
     print(f"❌ Database connection error: {str(e)}")
     print("📋 Troubleshooting steps:")
-    print("1. Install psycopg2-binary instead of psycopg2:")
-    print("   pip uninstall psycopg2")
-    print("   pip install psycopg2-binary")
-    print("2. Or use asyncpg for better Python 3.13 support:")
+    print("1. Install asyncpg for Python 3.13 support:")
     print("   pip install asyncpg")
+    print("2. Or downgrade Python to 3.11/3.12:")
+    print("   pyenv install 3.12.7")
     print("3. Check your requirements.txt")
 
-    # Create a dummy engine for build process
-    engine = None
+    # Create dummy engines for build process
+    async_engine = None
+    sync_engine = None
     SessionLocal = None
+    AsyncSessionLocal = None
     Base = declarative_base()
     DATABASE_AVAILABLE = False
+    SYNC_DB_AVAILABLE = False
 
 # JWT Configuration
 JWT_SECRET = os.getenv("JWT_SECRET", "your-secret-key-change-in-production")
@@ -123,12 +154,14 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 # Create tables only if engine is available
-if engine and DATABASE_AVAILABLE:
-    try:
-        Base.metadata.create_all(bind=engine)
-        print("✅ Database tables created/verified successfully!")
-    except Exception as e:
-        print(f"⚠️ Could not create tables: {str(e)}")
+async def create_tables():
+    if async_engine and DATABASE_AVAILABLE:
+        try:
+            async with async_engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            print("✅ Database tables created/verified successfully!")
+        except Exception as e:
+            print(f"⚠️ Could not create tables: {str(e)}")
 
 # Pydantic Models
 class DocumentCreate(BaseModel):
@@ -183,7 +216,7 @@ security = HTTPBearer()
 
 # Dependency to get database session
 def get_db():
-    if not SessionLocal or not DATABASE_AVAILABLE:
+    if not SessionLocal or not SYNC_DB_AVAILABLE:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Database connection not available. Please check database configuration."
@@ -199,6 +232,25 @@ def get_db():
         )
     finally:
         db.close()
+
+# Async database dependency
+async def get_async_db():
+    if not AsyncSessionLocal or not DATABASE_AVAILABLE:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Async database connection not available."
+        )
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+        except Exception as e:
+            await session.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Database error: {str(e)}"
+            )
+        finally:
+            await session.close()
 
 # JWT Token validation
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -262,101 +314,108 @@ async def send_email_notification(subject: str, body: str, recipients: List[str]
         print(f"Failed to send email: {str(e)}")
         return False
 
-# Reminder check function
+# Reminder check function using async database
 async def check_expiry_reminders():
     print(f"Running expiry reminder check at {datetime.now()}")
 
-    if not SessionLocal or not DATABASE_AVAILABLE:
-        print("Database connection not available for reminder check")
+    if not AsyncSessionLocal or not DATABASE_AVAILABLE:
+        print("Async database connection not available for reminder check")
         return
 
-    db = SessionLocal()
-    try:
-        # Get documents expiring within 30 days
-        thirty_days_from_now = date.today() + timedelta(days=30)
+    async with AsyncSessionLocal() as db:
+        try:
+            from sqlalchemy import select
+            # Get documents expiring within 30 days
+            thirty_days_from_now = date.today() + timedelta(days=30)
 
-        expiring_docs = db.query(Document).filter(
-            Document.expiry_date <= thirty_days_from_now,
-            Document.expiry_date >= date.today()
-        ).all()
+            # Use async query
+            result = await db.execute(
+                select(Document).filter(
+                    Document.expiry_date <= thirty_days_from_now,
+                    Document.expiry_date >= date.today()
+                )
+            )
+            expiring_docs = result.scalars().all()
 
-        if not expiring_docs:
-            print("No documents expiring within 30 days")
-            return
+            if not expiring_docs:
+                print("No documents expiring within 30 days")
+                return
 
-        # Get admin and owner users
-        admin_users = db.query(User).filter(
-            User.role.in_(["admin", "owner"])
-        ).all()
+            # Get admin and owner users
+            user_result = await db.execute(
+                select(User).filter(User.role.in_(["admin", "owner"]))
+            )
+            admin_users = user_result.scalars().all()
 
-        if not admin_users:
-            print("No admin or owner users found")
-            return
+            if not admin_users:
+                print("No admin or owner users found")
+                return
 
-        # Prepare email content
-        email_body = f"""
-        <html>
-        <body>
-            <h2>📋 Document Expiry Reminder</h2>
-            <p>The following {len(expiring_docs)} document(s) are expiring within 30 days:</p>
-            <table border="1" style="border-collapse: collapse; width: 100%;">
-                <tr style="background-color: #f2f2f2;">
-                    <th style="padding: 8px;">Document Type</th>
-                    <th style="padding: 8px;">Owner</th>
-                    <th style="padding: 8px;">Document Number</th>
-                    <th style="padding: 8px;">Expiry Date</th>
-                    <th style="padding: 8px;">Action Due Date</th>
-                </tr>
-        """
-
-        for doc in expiring_docs:
-            days_until_expiry = (doc.expiry_date - date.today()).days
-            color = "#ffebee" if days_until_expiry <= 7 else "#fff3e0" if days_until_expiry <= 14 else "#f3e5f5"
-
-            email_body += f"""
-                <tr style="background-color: {color};">
-                    <td style="padding: 8px;">{doc.document_type}</td>
-                    <td style="padding: 8px;">{doc.document_owner}</td>
-                    <td style="padding: 8px;">{doc.document_number}</td>
-                    <td style="padding: 8px;">{doc.expiry_date} ({days_until_expiry} days)</td>
-                    <td style="padding: 8px;">{doc.action_due_date}</td>
-                </tr>
+            # Prepare email content
+            email_body = f"""
+            <html>
+            <body>
+                <h2>📋 Document Expiry Reminder</h2>
+                <p>The following {len(expiring_docs)} document(s) are expiring within 30 days:</p>
+                <table border="1" style="border-collapse: collapse; width: 100%;">
+                    <tr style="background-color: #f2f2f2;">
+                        <th style="padding: 8px;">Document Type</th>
+                        <th style="padding: 8px;">Owner</th>
+                        <th style="padding: 8px;">Document Number</th>
+                        <th style="padding: 8px;">Expiry Date</th>
+                        <th style="padding: 8px;">Action Due Date</th>
+                    </tr>
             """
 
-        email_body += """
-            </table>
-            <br>
-            <p><strong>⚠️ Please take necessary action before the expiry dates.</strong></p>
-            <p><small>This is an automated reminder from your Document Management System.</small></p>
-        </body>
-        </html>
-        """
+            for doc in expiring_docs:
+                days_until_expiry = (doc.expiry_date - date.today()).days
+                color = "#ffebee" if days_until_expiry <= 7 else "#fff3e0" if days_until_expiry <= 14 else "#f3e5f5"
 
-        recipients = [user.email for user in admin_users]
+                email_body += f"""
+                    <tr style="background-color: {color};">
+                        <td style="padding: 8px;">{doc.document_type}</td>
+                        <td style="padding: 8px;">{doc.document_owner}</td>
+                        <td style="padding: 8px;">{doc.document_number}</td>
+                        <td style="padding: 8px;">{doc.expiry_date} ({days_until_expiry} days)</td>
+                        <td style="padding: 8px;">{doc.action_due_date}</td>
+                    </tr>
+                """
 
-        success = await send_email_notification(
-            subject=f"🔔 Document Expiry Reminder - {len(expiring_docs)} documents expiring soon",
-            body=email_body,
-            recipients=recipients
-        )
+            email_body += """
+                </table>
+                <br>
+                <p><strong>⚠️ Please take necessary action before the expiry dates.</strong></p>
+                <p><small>This is an automated reminder from your Document Management System.</small></p>
+            </body>
+            </html>
+            """
 
-        if success:
-            print(f"Reminder sent for {len(expiring_docs)} documents to {len(recipients)} recipients")
-        else:
-            print("Failed to send reminder email")
+            recipients = [user.email for user in admin_users]
 
-    except Exception as e:
-        print(f"Error in reminder check: {str(e)}")
-    finally:
-        db.close()
+            success = await send_email_notification(
+                subject=f"🔔 Document Expiry Reminder - {len(expiring_docs)} documents expiring soon",
+                body=email_body,
+                recipients=recipients
+            )
+
+            if success:
+                print(f"Reminder sent for {len(expiring_docs)} documents to {len(recipients)} recipients")
+            else:
+                print("Failed to send reminder email")
+
+        except Exception as e:
+            print(f"Error in reminder check: {str(e)}")
 
 # Scheduler setup
 scheduler = AsyncIOScheduler()
 
 @app.on_event("startup")
 async def startup_event():
+    # Create tables
+    await create_tables()
+
     # Only start scheduler if database is available
-    if SessionLocal and DATABASE_AVAILABLE:
+    if AsyncSessionLocal and DATABASE_AVAILABLE:
         try:
             # Schedule daily reminder check at 9 AM UTC
             scheduler.add_job(
@@ -380,6 +439,10 @@ async def shutdown_event():
     except Exception as e:
         print(f"Error shutting down scheduler: {str(e)}")
 
+    # Close async engine
+    if async_engine:
+        await async_engine.dispose()
+
 # API Endpoints
 
 @app.get("/")
@@ -391,8 +454,9 @@ async def root():
         "status": "active",
         "docs": "/docs",
         "health": "/health",
-        "database": "Neon PostgreSQL",
+        "database": "Neon PostgreSQL with asyncpg",
         "database_available": DATABASE_AVAILABLE,
+        "sync_db_available": SYNC_DB_AVAILABLE,
         "email_support": EMAIL_AVAILABLE,
         "python_version": "3.13"
     }
@@ -403,11 +467,10 @@ async def health_check():
     db_status = "disconnected"
     db_details = {}
 
-    if SessionLocal and DATABASE_AVAILABLE:
+    if AsyncSessionLocal and DATABASE_AVAILABLE:
         try:
-            db = SessionLocal()
-            with db.connection() as conn:
-                result = conn.execute(text("SELECT version(), current_database(), current_user"))
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(text("SELECT version(), current_database(), current_user"))
                 row = result.fetchone()
                 db_status = "connected"
                 db_details = {
@@ -415,7 +478,6 @@ async def health_check():
                     "database": row[1] if row[1] else "Unknown",
                     "user": row[2] if row[2] else "Unknown"
                 }
-            db.close()
         except Exception as e:
             db_status = f"error: {str(e)}"
 
@@ -426,7 +488,9 @@ async def health_check():
         "database_details": db_details,
         "scheduler": "running" if scheduler.running else "stopped",
         "email_support": EMAIL_AVAILABLE,
-        "python_version": "3.13"
+        "python_version": "3.13",
+        "async_db": DATABASE_AVAILABLE,
+        "sync_db": SYNC_DB_AVAILABLE
     }
 
 @app.post("/auth/token")
