@@ -1,4 +1,4 @@
-# main.py - Updated for Python 3.13 compatibility and Neon deployment
+# main.py - Fixed for Python 3.13 compatibility and Neon deployment
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,22 +18,21 @@ from dotenv import load_dotenv
 
 # Email imports with Python 3.13 compatibility
 try:
-    import smtplib
-    from email.mime.text import MIMEText
-    from email.mime.multipart import MIMEMultipart
+    import yagmail
     EMAIL_AVAILABLE = True
 except ImportError:
     # Fallback for email functionality
     EMAIL_AVAILABLE = False
-    print("⚠️ Email functionality not available - email imports failed")
+    print("⚠️ Email functionality not available - yagmail not installed")
 
 load_dotenv()
 
-# Database Configuration - Fixed for Neon
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://neondb_owner:npg_LuK5zQJy3Ftg@ep-lingering-leaf-a1qcmj51-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
-)
+# Database Configuration - Fixed for Neon with Python 3.13
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# If no DATABASE_URL in env, construct from your connection string
+if not DATABASE_URL:
+    DATABASE_URL = "postgresql://neondb_owner:npg_LuK5zQJy3Ftg@ep-lingering-leaf-a1qcmj51-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
 
 # Clean up the DATABASE_URL if it contains psql command wrapper
 if DATABASE_URL.startswith('psql '):
@@ -46,36 +45,51 @@ if DATABASE_URL.startswith('psql '):
 print(f"Connecting to database: {DATABASE_URL.split('@')[0]}@***")
 
 try:
-    # Create engine with Neon-specific settings
+    # Create engine with Neon-specific settings optimized for Python 3.13
     engine = create_engine(
         DATABASE_URL,
-        pool_size=10,
-        max_overflow=20,
+        pool_size=5,  # Reduced pool size
+        max_overflow=10,  # Reduced overflow
         pool_pre_ping=True,
         pool_recycle=300,
         connect_args={
             "sslmode": "require",
-            "application_name": "document-management-api"
-        }
+            "application_name": "document-management-api",
+            # Remove channel_binding as it might cause issues
+            "connect_timeout": 10,
+            "command_timeout": 30
+        },
+        echo=False  # Disable SQL logging for production
     )
 
-    # Test connection
+    # Test connection with proper error handling
     with engine.connect() as conn:
-        conn.execute(text("SELECT 1"))
+        result = conn.execute(text("SELECT 1"))
+        result.fetchone()
         print("✅ Database connection successful!")
 
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     Base = declarative_base()
+    DATABASE_AVAILABLE = True
 
 except Exception as e:
     print(f"❌ Database connection error: {str(e)}")
+    print("📋 Troubleshooting steps:")
+    print("1. Install psycopg2-binary instead of psycopg2:")
+    print("   pip uninstall psycopg2")
+    print("   pip install psycopg2-binary")
+    print("2. Or use asyncpg for better Python 3.13 support:")
+    print("   pip install asyncpg")
+    print("3. Check your requirements.txt")
+
     # Create a dummy engine for build process
     engine = None
     SessionLocal = None
     Base = declarative_base()
+    DATABASE_AVAILABLE = False
 
 # JWT Configuration
-JWT_SECRET = os.getenv("JWT_SECRET", "your-secret-key")
+JWT_SECRET = os.getenv("JWT_SECRET", "your-secret-key-change-in-production")
 JWT_ALGORITHM = "HS256"
 STATIC_TOKEN_STRING = "alphabeta"
 
@@ -109,7 +123,7 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 # Create tables only if engine is available
-if engine:
+if engine and DATABASE_AVAILABLE:
     try:
         Base.metadata.create_all(bind=engine)
         print("✅ Database tables created/verified successfully!")
@@ -158,7 +172,7 @@ app = FastAPI(
 # CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Configure properly for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -169,14 +183,20 @@ security = HTTPBearer()
 
 # Dependency to get database session
 def get_db():
-    if not SessionLocal:
+    if not SessionLocal or not DATABASE_AVAILABLE:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Database connection not available"
+            detail="Database connection not available. Please check database configuration."
         )
     db = SessionLocal()
     try:
         yield db
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error: {str(e)}"
+        )
     finally:
         db.close()
 
@@ -215,10 +235,10 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
             detail="Invalid token"
         )
 
-# Helper function to send email notifications
+# Helper function to send email notifications using yagmail
 async def send_email_notification(subject: str, body: str, recipients: List[str]):
     if not EMAIL_AVAILABLE:
-        print("Email functionality not available - skipping email notification")
+        print("Email functionality not available - yagmail not installed")
         return False
 
     if not SMTP_USERNAME or not SMTP_PASSWORD:
@@ -226,21 +246,17 @@ async def send_email_notification(subject: str, body: str, recipients: List[str]
         return False
 
     try:
-        msg = MIMEMultipart()
-        msg['From'] = SMTP_USERNAME
-        msg['Subject'] = subject
-        msg.attach(MIMEText(body, 'html'))
+        # Initialize yagmail SMTP client
+        yag = yagmail.SMTP(SMTP_USERNAME, SMTP_PASSWORD)
 
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
-        server.starttls()
-        server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        # Send email to all recipients
+        yag.send(
+            to=recipients,
+            subject=subject,
+            contents=body
+        )
 
-        for recipient in recipients:
-            msg['To'] = recipient
-            server.send_message(msg)
-            del msg['To']
-
-        server.quit()
+        yag.close()
         return True
     except Exception as e:
         print(f"Failed to send email: {str(e)}")
@@ -250,7 +266,7 @@ async def send_email_notification(subject: str, body: str, recipients: List[str]
 async def check_expiry_reminders():
     print(f"Running expiry reminder check at {datetime.now()}")
 
-    if not SessionLocal:
+    if not SessionLocal or not DATABASE_AVAILABLE:
         print("Database connection not available for reminder check")
         return
 
@@ -340,7 +356,7 @@ scheduler = AsyncIOScheduler()
 @app.on_event("startup")
 async def startup_event():
     # Only start scheduler if database is available
-    if SessionLocal:
+    if SessionLocal and DATABASE_AVAILABLE:
         try:
             # Schedule daily reminder check at 9 AM UTC
             scheduler.add_job(
@@ -358,8 +374,9 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     try:
-        scheduler.shutdown()
-        print("Scheduler shut down successfully")
+        if scheduler.running:
+            scheduler.shutdown()
+            print("Scheduler shut down successfully")
     except Exception as e:
         print(f"Error shutting down scheduler: {str(e)}")
 
@@ -375,7 +392,9 @@ async def root():
         "docs": "/docs",
         "health": "/health",
         "database": "Neon PostgreSQL",
-        "email_support": EMAIL_AVAILABLE
+        "database_available": DATABASE_AVAILABLE,
+        "email_support": EMAIL_AVAILABLE,
+        "python_version": "3.13"
     }
 
 @app.get("/health")
@@ -384,7 +403,7 @@ async def health_check():
     db_status = "disconnected"
     db_details = {}
 
-    if SessionLocal:
+    if SessionLocal and DATABASE_AVAILABLE:
         try:
             db = SessionLocal()
             with db.connection() as conn:
@@ -401,12 +420,13 @@ async def health_check():
             db_status = f"error: {str(e)}"
 
     return {
-        "status": "healthy",
+        "status": "healthy" if DATABASE_AVAILABLE else "degraded",
         "timestamp": datetime.utcnow(),
         "database": db_status,
         "database_details": db_details,
         "scheduler": "running" if scheduler.running else "stopped",
-        "email_support": EMAIL_AVAILABLE
+        "email_support": EMAIL_AVAILABLE,
+        "python_version": "3.13"
     }
 
 @app.post("/auth/token")
@@ -428,6 +448,7 @@ async def create_access_token(username: str, role: str = "user"):
         "role": role
     }
 
+# Document endpoints with proper error handling
 @app.post("/documents/", response_model=DocumentResponse)
 async def create_document(
     document: DocumentCreate,
@@ -610,6 +631,12 @@ async def manual_reminder_check(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only admin or owner can trigger manual reminder check"
+        )
+
+    if not DATABASE_AVAILABLE:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database not available for reminder check"
         )
 
     await check_expiry_reminders()
