@@ -13,7 +13,7 @@ psycopg[pool]>=3.2.2
 
 # Fallback: Keep psycopg2-binary for sync operations
 psycopg2-binary>=2.9.9
-
+reportlab==4.0.8
 # Authentication & Security
 pyjwt==2.8.0
 passlib[bcrypt]==1.7.4

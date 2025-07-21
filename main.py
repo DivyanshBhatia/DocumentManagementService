@@ -476,7 +476,6 @@ async def check_expiry_reminders():
         except Exception as e:
             print(f"Error in reminder check: {str(e)}")
 
-# Fixed PDF generation function
 def generate_pdf_report(documents: List[Document]) -> io.BytesIO:
     """Generate PDF report of documents"""
     if not PDF_AVAILABLE:
@@ -548,37 +547,36 @@ def generate_pdf_report(documents: List[Document]) -> io.BytesIO:
         data = [
             ['S.No', 'Type', 'Owner', 'Document Number', 'Expiry Date', 'Action Due', 'Status']
         ]
-        status = "UNKNOWN"
-        for doc in documents:
-            # Handle None expiry dates
-            if doc.expiry_date:
-                days_until_expiry = (doc.expiry_date - date.today()).days
-                expiry_str = doc.expiry_date.strftime('%Y-%m-%d')
+
+        for document_item in documents:
+            # Determine status based on expiry date
+            if document_item.expiry_date:
+                days_until_expiry = (document_item.expiry_date - date.today()).days
+                expiry_str = document_item.expiry_date.strftime('%Y-%m-%d')
 
                 if days_until_expiry < 0:
-                    status = "EXPIRED"
+                    document_status = "EXPIRED"
                 elif days_until_expiry <= 7:
-                    status = "URGENT"
+                    document_status = "URGENT"
                 elif days_until_expiry <= 30:
-                    status = "WARNING"
+                    document_status = "WARNING"
                 else:
-                    status = "OK"
+                    document_status = "OK"
             else:
-                days_until_expiry = None
                 expiry_str = "N/A"
-                status = "NO DATE"
+                document_status = "NO DATE"
 
             # Handle None action due dates
-            action_due_str = doc.action_due_date.strftime('%Y-%m-%d') if doc.action_due_date else "N/A"
+            action_due_str = document_item.action_due_date.strftime('%Y-%m-%d') if document_item.action_due_date else "N/A"
 
             data.append([
-                str(doc.sno),
-                doc.document_type or "N/A",
-                doc.document_owner or "N/A",
-                doc.document_number or "N/A",
+                str(document_item.sno),
+                document_item.document_type or "N/A",
+                document_item.document_owner or "N/A",
+                document_item.document_number or "N/A",
                 expiry_str,
                 action_due_str,
-                status
+                document_status
             ])
 
         # Create table
@@ -600,9 +598,9 @@ def generate_pdf_report(documents: List[Document]) -> io.BytesIO:
         ]))
 
         # Add row coloring based on status
-        for i, doc in enumerate(documents, start=1):
-            if doc.expiry_date:
-                days_until_expiry = (doc.expiry_date - date.today()).days
+        for i, document_item in enumerate(documents, start=1):
+            if document_item.expiry_date:
+                days_until_expiry = (document_item.expiry_date - date.today()).days
                 if days_until_expiry < 0:
                     # Expired - red background
                     table.setStyle(TableStyle([('BACKGROUND', (0, i), (-1, i), colors.lightpink)]))
@@ -635,6 +633,7 @@ def generate_pdf_report(documents: List[Document]) -> io.BytesIO:
     doc.build(elements)
     buffer.seek(0)
     return buffer
+
 
 # Scheduler setup
 scheduler = AsyncIOScheduler()
