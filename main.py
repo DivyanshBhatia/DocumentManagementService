@@ -2,6 +2,7 @@
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from sqlalchemy import Column, Integer, String, Date, DateTime, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
@@ -16,6 +17,20 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import os
 from dotenv import load_dotenv
+import io
+
+# PDF generation imports
+try:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter, A4
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    PDF_AVAILABLE = True
+except ImportError:
+    # Fallback for PDF functionality
+    PDF_AVAILABLE = False
+    print("⚠️ PDF functionality not available - reportlab not installed")
 
 # Email imports with Python 3.13 compatibility
 try:
@@ -33,7 +48,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 # If no DATABASE_URL in env, construct from your connection string
 if not DATABASE_URL:
-    DATABASE_URL = "postgresql://neondb_owner:npg_LuK5zQJy3Ftg@ep-lingering-leaf-a1qcmj51-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
+    print(f"Connecting to database: Failed as unable to find DATABASE_URL")
 
 # Clean up the DATABASE_URL if it contains psql command wrapper
 if DATABASE_URL.startswith('psql '):
@@ -461,6 +476,166 @@ async def check_expiry_reminders():
         except Exception as e:
             print(f"Error in reminder check: {str(e)}")
 
+# Fixed PDF generation function
+def generate_pdf_report(documents: List[Document]) -> io.BytesIO:
+    """Generate PDF report of documents"""
+    if not PDF_AVAILABLE:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="PDF functionality not available - reportlab not installed"
+        )
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4)
+    elements = []
+
+    # Get styles
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=18,
+        spaceAfter=30,
+        alignment=1,  # Center alignment
+    )
+
+    # Title
+    title = Paragraph("Document Management Report", title_style)
+    elements.append(title)
+
+    # Add generation date
+    date_style = ParagraphStyle(
+        'DateStyle',
+        parent=styles['Normal'],
+        fontSize=10,
+        alignment=1,  # Center alignment
+        spaceAfter=20,
+    )
+
+    generation_date = Paragraph(
+        f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        date_style
+    )
+    elements.append(generation_date)
+
+    elements.append(Spacer(1, 12))
+
+    if not documents:
+        no_docs = Paragraph("No documents found.", styles['Normal'])
+        elements.append(no_docs)
+    else:
+        # Summary - Fixed to handle None expiry dates
+        total_docs = len(documents)
+        expired_docs = len([
+            doc for doc in documents
+            if doc.expiry_date and doc.expiry_date < date.today()
+        ])
+        expiring_soon = len([
+            doc for doc in documents
+            if doc.expiry_date and
+            doc.expiry_date <= date.today() + timedelta(days=30) and
+            doc.expiry_date >= date.today()
+        ])
+
+        summary = Paragraph(
+            f"<b>Summary:</b> Total Documents: {total_docs} | Expired: {expired_docs} | Expiring within 30 days: {expiring_soon}",
+            styles['Normal']
+        )
+        elements.append(summary)
+        elements.append(Spacer(1, 20))
+
+        # Create table data
+        data = [
+            ['S.No', 'Type', 'Owner', 'Document Number', 'Expiry Date', 'Action Due', 'Status']
+        ]
+
+        for doc in documents:
+            # Handle None expiry dates
+            if doc.expiry_date:
+                days_until_expiry = (doc.expiry_date - date.today()).days
+                expiry_str = doc.expiry_date.strftime('%Y-%m-%d')
+
+                if days_until_expiry < 0:
+                    status = "EXPIRED"
+                elif days_until_expiry <= 7:
+                    status = "URGENT"
+                elif days_until_expiry <= 30:
+                    status = "WARNING"
+                else:
+                    status = "OK"
+            else:
+                days_until_expiry = None
+                expiry_str = "N/A"
+                status = "NO DATE"
+
+            # Handle None action due dates
+            action_due_str = doc.action_due_date.strftime('%Y-%m-%d') if doc.action_due_date else "N/A"
+
+            data.append([
+                str(doc.sno),
+                doc.document_type or "N/A",
+                doc.document_owner or "N/A",
+                doc.document_number or "N/A",
+                expiry_str,
+                action_due_str,
+                status
+            ])
+
+        # Create table
+        table = Table(data)
+
+        # Style the table
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 1), (-1, -1), 8),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]))
+
+        # Add row coloring based on status
+        for i, doc in enumerate(documents, start=1):
+            if doc.expiry_date:
+                days_until_expiry = (doc.expiry_date - date.today()).days
+                if days_until_expiry < 0:
+                    # Expired - red background
+                    table.setStyle(TableStyle([('BACKGROUND', (0, i), (-1, i), colors.lightpink)]))
+                elif days_until_expiry <= 7:
+                    # Urgent - orange background
+                    table.setStyle(TableStyle([('BACKGROUND', (0, i), (-1, i), colors.orange)]))
+                elif days_until_expiry <= 30:
+                    # Warning - yellow background
+                    table.setStyle(TableStyle([('BACKGROUND', (0, i), (-1, i), colors.lightyellow)]))
+            else:
+                # No expiry date - gray background
+                table.setStyle(TableStyle([('BACKGROUND', (0, i), (-1, i), colors.lightgrey)]))
+
+        elements.append(table)
+
+        # Add legend
+        elements.append(Spacer(1, 20))
+        legend = Paragraph(
+            "<b>Status Legend:</b><br/>"
+            "• EXPIRED: Document has already expired<br/>"
+            "• URGENT: Expires within 7 days<br/>"
+            "• WARNING: Expires within 30 days<br/>"
+            "• OK: More than 30 days until expiry<br/>"
+            "• NO DATE: No expiry date set",
+            styles['Normal']
+        )
+        elements.append(legend)
+
+    # Build PDF
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer
+
 # Scheduler setup
 scheduler = AsyncIOScheduler()
 
@@ -517,6 +692,7 @@ async def root():
         "database_available": DATABASE_AVAILABLE,
         "sync_db_available": SYNC_DB_AVAILABLE,
         "email_support": EMAIL_AVAILABLE,
+        "pdf_support": PDF_AVAILABLE,
         "python_version": "3.13"
     }
 
@@ -563,6 +739,7 @@ async def health_check():
         "table_status": table_status,
         "scheduler": "running" if scheduler.running else "stopped",
         "email_support": EMAIL_AVAILABLE,
+        "pdf_support": PDF_AVAILABLE,
         "python_version": "3.13",
         "async_db": DATABASE_AVAILABLE,
         "sync_db": SYNC_DB_AVAILABLE
@@ -610,7 +787,7 @@ async def create_tables_endpoint():
             detail=f"Failed to create tables: {str(e)}"
         )
 
-# Document endpoints with proper error handling
+# Document endpoints with proper error handling - Updated to sort by expiry date
 @app.post("/documents/", response_model=DocumentResponse)
 async def create_document(
     document: DocumentCreate,
@@ -667,7 +844,7 @@ async def get_documents(
     db: Session = Depends(get_db),
     current_user: TokenData = Depends(verify_token)
 ):
-    """Retrieve all documents with pagination and filtering"""
+    """Retrieve all documents with pagination and filtering - sorted by earliest expiry date first"""
     query = db.query(Document)
 
     if document_type:
@@ -676,6 +853,11 @@ async def get_documents(
     if owner:
         query = query.filter(Document.document_owner.ilike(f"%{owner}%"))
 
+    # Order by expiry date (earliest first), then by action due date
+    query = query.order_by(
+        Document.expiry_date.asc().nulls_last(),
+        Document.action_due_date.asc().nulls_last()
+    )
     documents = query.offset(skip).limit(limit).all()
     return documents
 
@@ -823,6 +1005,78 @@ async def get_expiring_documents(
         "count": len(expiring_docs),
         "days_ahead": days
     }
+
+# Download report endpoint
+@app.get("/documents/download-report/")
+async def download_documents_report(
+    document_type: Optional[str] = None,
+    owner: Optional[str] = None,
+    status_filter: Optional[str] = None,  # expired, urgent, warning, ok
+    db: Session = Depends(get_db),
+    current_user: TokenData = Depends(verify_token)
+):
+    """Download PDF report of documents with optional filtering"""
+
+    # Build query with filters
+    query = db.query(Document)
+
+    if document_type:
+        query = query.filter(Document.document_type.ilike(f"%{document_type}%"))
+
+    if owner:
+        query = query.filter(Document.document_owner.ilike(f"%{owner}%"))
+
+    # Apply status filter if specified
+    if status_filter:
+        today = date.today()
+        if status_filter.lower() == "expired":
+            query = query.filter(Document.expiry_date < today)
+        elif status_filter.lower() == "urgent":
+            urgent_date = today + timedelta(days=7)
+            query = query.filter(
+                Document.expiry_date >= today,
+                Document.expiry_date <= urgent_date
+            )
+        elif status_filter.lower() == "warning":
+            warning_date = today + timedelta(days=30)
+            urgent_date = today + timedelta(days=7)
+            query = query.filter(
+                Document.expiry_date > urgent_date,
+                Document.expiry_date <= warning_date
+            )
+        elif status_filter.lower() == "ok":
+            ok_date = today + timedelta(days=30)
+            query = query.filter(Document.expiry_date > ok_date)
+
+    # Order by expiry date (earliest first)
+    query = query.order_by(
+        Document.expiry_date.asc().nulls_last(),
+        Document.action_due_date.asc().nulls_last()
+    )
+
+    documents = query.all()
+
+    try:
+        # Generate PDF
+        pdf_buffer = generate_pdf_report(documents)
+
+        # Create filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"documents_report_{timestamp}.pdf"
+
+        # Return PDF as response
+        return StreamingResponse(
+            io.BytesIO(pdf_buffer.read()),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate PDF report: {str(e)}"
+        )
+
 
 if __name__ == "__main__":
     import uvicorn
