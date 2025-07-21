@@ -548,7 +548,7 @@ def generate_pdf_report(documents: List[Document]) -> io.BytesIO:
         data = [
             ['S.No', 'Type', 'Owner', 'Document Number', 'Expiry Date', 'Action Due', 'Status']
         ]
-
+        status = "UNKNOWN"
         for doc in documents:
             # Handle None expiry dates
             if doc.expiry_date:
